@@ -1,12 +1,11 @@
 import type { GenerationSession, GeneratorSettings, NumberEntry } from "./types";
 
 const DB_NAME = "italian-number-generator";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const DEFAULT_SETTINGS: GeneratorSettings = {
   countryCode: "39",
   quantity: 1000,
   batchSize: 500,
-  avoidDuplicates: true,
   exportFormat: "TXT"
 };
 
@@ -19,13 +18,20 @@ function openDatabase(): Promise<IDBDatabase> {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
     request.onupgradeneeded = () => {
       const database = request.result;
-      const sessions = database.createObjectStore("sessions", { keyPath: "id" });
-      sessions.createIndex("createdAt", "createdAt");
-      const entries = database.createObjectStore("entries", { keyPath: "id", autoIncrement: true });
-      entries.createIndex("sessionId", "sessionId");
-      entries.createIndex("sessionEntry", ["sessionId", "id"]);
-      entries.createIndex("number", "number");
-      database.createObjectStore("settings", { keyPath: "key" });
+      if (!database.objectStoreNames.contains("sessions")) {
+        const sessions = database.createObjectStore("sessions", { keyPath: "id" });
+        sessions.createIndex("createdAt", "createdAt");
+      }
+      if (!database.objectStoreNames.contains("entries")) {
+        const entries = database.createObjectStore("entries", { keyPath: "id", autoIncrement: true });
+        entries.createIndex("sessionId", "sessionId");
+        entries.createIndex("sessionEntry", ["sessionId", "id"]);
+        entries.createIndex("number", "number");
+      }
+      if (!database.objectStoreNames.contains("settings")) database.createObjectStore("settings", { keyPath: "key" });
+      if (!database.objectStoreNames.contains("masterNumbers")) {
+        database.createObjectStore("masterNumbers", { keyPath: "number" });
+      }
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("Could not open local storage."));
@@ -50,7 +56,13 @@ export async function getSettings(): Promise<GeneratorSettings> {
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
-  return result?.value ?? DEFAULT_SETTINGS;
+  if (!result?.value) return DEFAULT_SETTINGS;
+  return {
+    countryCode: result.value.countryCode,
+    quantity: result.value.quantity,
+    batchSize: result.value.batchSize,
+    exportFormat: result.value.exportFormat
+  };
 }
 
 export async function saveSettings(settings: GeneratorSettings): Promise<void> {
@@ -93,37 +105,125 @@ export async function getSessions(): Promise<GenerationSession[]> {
 
 export async function saveBatch(
   sessionId: string,
-  numbers: string[],
-  avoidDuplicates: boolean
+  numbers: string[]
 ): Promise<{ inserted: number; skipped: number }> {
   const database = await openDatabase();
-  const tx = database.transaction("entries", "readwrite");
+  const tx = database.transaction(["entries", "masterNumbers"], "readwrite");
   const store = tx.objectStore("entries");
-  const numberIndex = store.index("number");
+  const masterStore = tx.objectStore("masterNumbers");
   const createdAt = Date.now();
   let inserted = 0;
   let skipped = 0;
 
-  if (avoidDuplicates) {
-    for (const number of numbers) {
-      const lookup = numberIndex.get(number);
-      lookup.onsuccess = () => {
-        if (lookup.result) {
-          skipped += 1;
-          return;
-        }
-        store.add({ sessionId, number, createdAt } satisfies NumberEntry);
-        inserted += 1;
-      };
-    }
-  } else {
-    for (const number of numbers) {
-      store.add({ sessionId, number, createdAt } satisfies NumberEntry);
-      inserted += 1;
-    }
+  for (const number of numbers) {
+    const request = masterStore.add({ number });
+    request.onsuccess = () => {
+      const entryRequest = store.add({ sessionId, number, createdAt } satisfies NumberEntry);
+      entryRequest.onsuccess = () => { inserted += 1; };
+    };
+    request.onerror = (event) => {
+      if (request.error?.name !== "ConstraintError") return;
+      event.preventDefault();
+      event.stopPropagation();
+      skipped += 1;
+    };
   }
   await transactionDone(tx);
   return { inserted, skipped };
+}
+
+export interface MasterInfo {
+  count: number;
+  initialized: boolean;
+  sourceName?: string;
+  importedAt?: number;
+}
+
+export async function getMasterInfo(): Promise<MasterInfo> {
+  const database = await openDatabase();
+  const tx = database.transaction(["masterNumbers", "settings"], "readonly");
+  const countRequest = tx.objectStore("masterNumbers").count();
+  const metadataRequest = tx.objectStore("settings").get("master-metadata");
+  const [count, metadata] = await Promise.all([
+    new Promise<number>((resolve, reject) => {
+      countRequest.onsuccess = () => resolve(countRequest.result);
+      countRequest.onerror = () => reject(countRequest.error);
+    }),
+    new Promise<{ value?: Omit<MasterInfo, "count"> } | undefined>((resolve, reject) => {
+      metadataRequest.onsuccess = () => resolve(metadataRequest.result);
+      metadataRequest.onerror = () => reject(metadataRequest.error);
+    })
+  ]);
+  return { count, initialized: metadata?.value?.initialized ?? false, sourceName: metadata?.value?.sourceName, importedAt: metadata?.value?.importedAt };
+}
+
+export async function importMasterBatch(numbers: string[]): Promise<{ inserted: number; skipped: number }> {
+  const database = await openDatabase();
+  const tx = database.transaction("masterNumbers", "readwrite");
+  const store = tx.objectStore("masterNumbers");
+  let inserted = 0;
+  let skipped = 0;
+  for (const number of numbers) {
+    const request = store.add({ number });
+    request.onsuccess = () => { inserted += 1; };
+    request.onerror = (event) => {
+      if (request.error?.name !== "ConstraintError") return;
+      event.preventDefault();
+      event.stopPropagation();
+      skipped += 1;
+    };
+  }
+  await transactionDone(tx);
+  return { inserted, skipped };
+}
+
+export async function markMasterInitialized(sourceName: string): Promise<void> {
+  const database = await openDatabase();
+  const tx = database.transaction("settings", "readwrite");
+  tx.objectStore("settings").put({
+    key: "master-metadata",
+    value: { initialized: true, sourceName, importedAt: Date.now() }
+  });
+  await transactionDone(tx);
+}
+
+export async function streamMaster(
+  onChunk: (numbers: string[]) => Promise<void>,
+  chunkSize = 1000
+): Promise<number> {
+  let count = 0;
+  let lowerKey: IDBValidKey | undefined;
+  let exclusive = false;
+  while (true) {
+    const database = await openDatabase();
+    const tx = database.transaction("masterNumbers", "readonly");
+    const store = tx.objectStore("masterNumbers");
+    const range = lowerKey === undefined
+      ? undefined
+      : IDBKeyRange.lowerBound(lowerKey, exclusive);
+    const request = store.openCursor(range);
+    const page = await new Promise<{ numbers: string[]; lastKey?: string }>((resolve, reject) => {
+      const numbers: string[] = [];
+      let lastKey: string | undefined;
+      request.onerror = () => reject(request.error ?? new Error("Could not read the master data."));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return resolve({ numbers, lastKey });
+        numbers.push((cursor.value as { number: string }).number);
+        lastKey = cursor.primaryKey as string;
+        if (numbers.length >= chunkSize) resolve({ numbers, lastKey });
+        else cursor.continue();
+      };
+    });
+    await transactionDone(tx);
+    if (page.numbers.length === 0) break;
+    await onChunk(page.numbers);
+    count += page.numbers.length;
+    if (page.numbers.length < chunkSize || page.lastKey === undefined) break;
+    lowerKey = page.lastKey;
+    exclusive = true;
+  }
+  return count;
 }
 
 export async function countEntries(): Promise<number> {

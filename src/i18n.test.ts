@@ -16,5 +16,6 @@ describe("Italian and English interface language", () => {
     expect(translateText("Switch to light mode", "it")).toBe("Attiva la modalità chiara");
     expect(translateText("TXT — one number per line", "it")).toBe("TXT — un numero per riga");
     expect(translateText("CSV — spreadsheet ready", "it")).toBe("CSV — pronto per i fogli di calcolo");
+    expect(translateText("Always on", "it")).toBe("Sempre attivo");
   });
 });

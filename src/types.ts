@@ -6,7 +6,6 @@ export interface GeneratorSettings {
   countryCode: string;
   quantity: number;
   batchSize: number;
-  avoidDuplicates: boolean;
   exportFormat: ExportFormat;
 }
 

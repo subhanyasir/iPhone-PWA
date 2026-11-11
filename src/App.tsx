@@ -5,12 +5,14 @@ import {
   Radio, Settings as SettingsIcon, ShieldCheck, Smartphone, Sun, Trash2, TriangleAlert, X
 } from "lucide-react";
 import {
-  countEntries, createSession, deleteAllData, deleteSession, estimateStorage, getSessionEntryCount,
-  getSessions, getSettings, markInterruptedSessions, saveBatch, saveSettings, streamSession, updateSession
+  countEntries, createSession, deleteAllData, deleteSession, estimateStorage, getMasterInfo, getSessionEntryCount,
+  getSessions, getSettings, importMasterBatch, markInterruptedSessions, markMasterInitialized, saveBatch, saveSettings, streamMaster, streamSession, updateSession
 } from "./db";
+import type { MasterInfo } from "./db";
 import type { GenerationSession, GeneratorSettings, Section, SessionStatus } from "./types";
 import { exportHeader, formatExportChunk } from "./exportFormat";
 import { formatLocale, translateText, type Locale } from "./i18n";
+import { processMasterFile } from "./masterFile";
 
 const navigation: { name: Section; icon: typeof Home }[] = [
   { name: "Dashboard", icon: Home },
@@ -24,7 +26,6 @@ const initialSettings: GeneratorSettings = {
   countryCode: "39",
   quantity: 1000,
   batchSize: 500,
-  avoidDuplicates: true,
   exportFormat: "TXT"
 };
 const LocaleContext = createContext<Locale>("it");
@@ -48,6 +49,15 @@ interface ActiveGeneration {
   pendingSave?: Promise<void>;
 }
 
+interface MasterImportProgress {
+  fileName: string;
+  bytesRead: number;
+  totalBytes: number;
+  inserted: number;
+  duplicates: number;
+  invalid: number;
+}
+
 function App() {
   const [locale, setLocale] = useState<Locale>(() => localStorage.getItem("numero-locale") === "en" ? "en" : "it");
   const [theme, setTheme] = useState<"dark" | "light">(() => localStorage.getItem("numero-theme") === "light" ? "light" : "dark");
@@ -56,8 +66,12 @@ function App() {
   const [sessions, setSessions] = useState<GenerationSession[]>([]);
   const [totalEntries, setTotalEntries] = useState(0);
   const [storage, setStorage] = useState<{ usage?: number; quota?: number }>({});
+  const [masterInfo, setMasterInfo] = useState<MasterInfo>({ count: 0, initialized: false });
+  const [masterImport, setMasterImport] = useState<MasterImportProgress | null>(null);
+  const [masterExporting, setMasterExporting] = useState(false);
+  const [masterExportProgress, setMasterExportProgress] = useState(0);
   const [active, setActive] = useState<ActiveGeneration | null>(null);
-  const [progress, setProgress] = useState({ done: 0, speed: 0, paused: false, startedAt: 0 });
+  const [progress, setProgress] = useState({ done: 0, skipped: 0, speed: 0, paused: false, startedAt: 0 });
   const [selectedExportId, setSelectedExportId] = useState("");
   const [exporting, setExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
@@ -88,10 +102,13 @@ function App() {
   }, [locale, theme]);
 
   const refresh = useCallback(async () => {
-    const [nextSessions, entries, nextStorage] = await Promise.all([getSessions(), countEntries(), estimateStorage()]);
+    const [nextSessions, entries, nextStorage, nextMasterInfo] = await Promise.all([
+      getSessions(), countEntries(), estimateStorage(), getMasterInfo()
+    ]);
     setSessions(nextSessions);
     setTotalEntries(entries);
     setStorage(nextStorage);
+    setMasterInfo(nextMasterInfo);
   }, []);
 
   useEffect(() => {
@@ -123,6 +140,51 @@ function App() {
     void saveSettings(next).catch((cause: unknown) => setError(cause instanceof Error ? cause.message : "Could not save settings."));
   };
 
+  const importMasterFile = async (file: File) => {
+    if (activeRef.current) {
+      setError("Cancel the active generation before importing a master file.");
+      return;
+    }
+    if (masterImport) return;
+    setError("");
+    setNotice("");
+    setMasterImport({
+      fileName: file.name,
+      bytesRead: 0,
+      totalBytes: file.size,
+      inserted: 0,
+      duplicates: 0,
+      invalid: 0
+    });
+    let inserted = 0;
+    let duplicates = 0;
+    try {
+      const result = await processMasterFile(file, async (numbers) => {
+        const batchResult = await importMasterBatch(numbers);
+        inserted += batchResult.inserted;
+        duplicates += batchResult.skipped;
+        setMasterImport((current) => current ? { ...current, inserted, duplicates } : current);
+      }, (bytesRead) => {
+        setMasterImport((current) => current ? { ...current, bytesRead } : current);
+      });
+      if (result.valid === 0) throw new Error("No valid phone numbers were found. Use a text file with one phone number per line.");
+      await markMasterInitialized(file.name);
+      setMasterImport((current) => current ? { ...current, invalid: result.invalid } : current);
+      await refresh();
+      setNotice(`Master imported: ${formatNumber(inserted)} new numbers; ${formatNumber(duplicates)} duplicate values skipped; ${formatNumber(result.invalid)} invalid lines skipped.`);
+    } catch (cause) {
+      const isQuotaError = cause instanceof DOMException && cause.name === "QuotaExceededError";
+      setError(isQuotaError
+        ? "Device storage is full. The import stopped; already imported numbers remain safe. Free browser storage and import the file again."
+        : cause instanceof Error ? cause.message : "Could not import the master file.");
+      await refresh().catch((refreshCause: unknown) => {
+        setError(refreshCause instanceof Error ? refreshCause.message : "Could not refresh local data.");
+      });
+    } finally {
+      setMasterImport(null);
+    }
+  };
+
   const finishGeneration = useCallback(async (status: SessionStatus, generation: ActiveGeneration) => {
     if (generation.pendingSave) await generation.pendingSave;
     generation.worker.terminate();
@@ -139,8 +201,17 @@ function App() {
   const startGeneration = async () => {
     setError("");
     setNotice("");
+    if (masterImport) {
+      setError("Wait for the master file import to finish before generating numbers.");
+      return;
+    }
     if (activeRef.current) {
       setError("A generation session is already active. Finish or cancel it before starting another.");
+      return;
+    }
+    if (!masterInfo.initialized) {
+      setError("Import your master file before generating numbers.");
+      setSection("Settings");
       return;
     }
     if (!/^\d{1,4}$/.test(settings.countryCode)) {
@@ -164,7 +235,7 @@ function App() {
         generated: 0,
         countryCode: settings.countryCode,
         batchSize: settings.batchSize,
-        avoidDuplicates: settings.avoidDuplicates,
+        avoidDuplicates: true,
         exportFormat: settings.exportFormat,
         status: "running"
       };
@@ -175,7 +246,7 @@ function App() {
       cancelRef.current = false;
       generationErrorRef.current = false;
       setActive(generation);
-      setProgress({ done: 0, speed: 0, paused: false, startedAt: Date.now() });
+      setProgress({ done: 0, skipped: 0, speed: 0, paused: false, startedAt: Date.now() });
       setSection("Generate");
       worker.onmessage = async (event: MessageEvent<{ type: string; numbers?: string[] }>) => {
         const current = activeRef.current;
@@ -184,11 +255,14 @@ function App() {
           const batch = event.data.numbers;
           current.pendingSave = (async () => {
             try {
-              const { inserted } = await saveBatch(session.id, batch, settings.avoidDuplicates);
+              const { inserted, skipped } = await saveBatch(session.id, batch);
               current.session = { ...current.session, generated: current.session.generated + inserted, updatedAt: Date.now() };
               await updateSession(current.session);
-              setProgress((previous) => ({ ...previous, done: current.session.generated }));
-              if (inserted > 0) setTotalEntries((previous) => previous + inserted);
+              setProgress((previous) => ({ ...previous, done: current.session.generated, skipped: previous.skipped + skipped }));
+              if (inserted > 0) {
+                setTotalEntries((previous) => previous + inserted);
+                setMasterInfo((previous) => ({ ...previous, count: previous.count + inserted }));
+              }
               if (cancelRef.current) current.worker.postMessage({ type: "cancel" });
               else current.worker.postMessage({ type: "ack", inserted });
             } catch (cause) {
@@ -310,6 +384,64 @@ function App() {
     }
   };
 
+  const downloadMaster = async () => {
+    setError("");
+    setNotice("");
+    setMasterExporting(true);
+    setMasterExportProgress(0);
+    let writable: FileSystemWritableFileStream | undefined;
+    const parts: BlobPart[] = [];
+    let exported = 0;
+    try {
+      const pickerWindow = window as Window & {
+        showSaveFilePicker?: (options: {
+          suggestedName: string;
+          types: { description: string; accept: Record<string, string[]> }[];
+        }) => Promise<{ createWritable: () => Promise<FileSystemWritableFileStream> }>;
+      };
+      if (pickerWindow.showSaveFilePicker) {
+        const handle = await pickerWindow.showSaveFilePicker({
+          suggestedName: "italian-number-master.txt",
+          types: [{ description: "TXT file", accept: { "text/plain": [".txt"] } }]
+        });
+        writable = await handle.createWritable();
+      } else if (masterInfo.count * 16 > 64 * 1024 * 1024) {
+        throw new Error("This browser cannot safely download a master file this large. Use Chrome or Edge on your PC to stream the updated master to disk.");
+      }
+
+      await streamMaster(async (numbers) => {
+        const text = formatExportChunk(numbers, "TXT");
+        if (writable) await writable.write(text);
+        else parts.push(text);
+        exported += numbers.length;
+        setMasterExportProgress(masterInfo.count
+          ? Math.min(100, Math.round((exported / masterInfo.count) * 100))
+          : 100);
+      });
+
+      if (writable) await writable.close();
+      else {
+        const blob = new Blob(parts, { type: "text/plain;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "italian-number-master.txt";
+        document.body.append(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      }
+      setNotice(`Master file exported: ${formatNumber(exported)} unique numbers.`);
+    } catch (cause) {
+      if (writable) await writable.abort().catch(() => undefined);
+      if (cause instanceof DOMException && cause.name === "AbortError") setNotice("Export cancelled.");
+      else setError(cause instanceof Error ? cause.message : "Export failed.");
+    } finally {
+      setMasterExporting(false);
+      setMasterExportProgress(0);
+    }
+  };
+
   const removeSession = async (session: GenerationSession) => {
     if (!window.confirm(translateText(`Delete ${formatNumber(session.generated)} entries from this session? This cannot be undone.`, locale))) return;
     try {
@@ -349,6 +481,8 @@ function App() {
         return <Generate
           settings={settings}
           updateSettings={updateSettings}
+          masterInfo={masterInfo}
+          masterImporting={!!masterImport}
           active={active}
           progress={{ ...progress, speed }}
           percentComplete={percentComplete}
@@ -356,6 +490,7 @@ function App() {
           pause={pauseGeneration}
           resume={resumeGeneration}
           cancel={cancelGeneration}
+          onOpenSettings={() => setSection("Settings")}
         />;
       case "History":
         return <HistoryPage sessions={sessions} onExport={downloadSession} onDelete={removeSession} exporting={exporting} />;
@@ -371,7 +506,18 @@ function App() {
           exportProgress={exportProgress}
         />;
       case "Settings":
-        return <SettingsPage settings={settings} updateSettings={updateSettings} onDeleteAll={removeAll} totalEntries={totalEntries} />;
+        return <SettingsPage
+          settings={settings}
+          updateSettings={updateSettings}
+          onDeleteAll={removeAll}
+          totalEntries={totalEntries}
+          masterInfo={masterInfo}
+          masterImport={masterImport}
+          onImportMaster={importMasterFile}
+          masterExporting={masterExporting}
+          masterExportProgress={masterExportProgress}
+          onExportMaster={downloadMaster}
+        />;
     }
   };
 
@@ -532,16 +678,19 @@ function MetricCard({ icon: Icon, label, value, detail, tone }: {
   return <TranslateTree><article className="metric-card"><div className={`metric-icon ${tone}`}><Icon size={18} /></div><div className="metric-label">{label}</div><div className="metric-value">{value}</div><div className="metric-detail">{detail}</div></article></TranslateTree>;
 }
 
-function Generate({ settings, updateSettings, active, progress, percentComplete, start, pause, resume, cancel }: {
+function Generate({ settings, updateSettings, masterInfo, masterImporting, active, progress, percentComplete, start, pause, resume, cancel, onOpenSettings }: {
   settings: GeneratorSettings;
   updateSettings: (patch: Partial<GeneratorSettings>) => void;
+  masterInfo: MasterInfo;
+  masterImporting: boolean;
   active: ActiveGeneration | null;
-  progress: { done: number; speed: number; paused: boolean };
+  progress: { done: number; skipped: number; speed: number; paused: boolean };
   percentComplete: number;
   start: () => void;
   pause: () => void;
   resume: () => void;
   cancel: () => void;
+  onOpenSettings: () => void;
 }) {
   return (
     <TranslateTree>
@@ -554,22 +703,29 @@ function Generate({ settings, updateSettings, active, progress, percentComplete,
           <label className="field-label">Batch size<span className="field-hint">Smaller batches use less memory</span><select value={settings.batchSize} disabled={!!active} onChange={(event) => updateSettings({ batchSize: Number(event.target.value) })}><option value={100}>{formatNumber(100)} entries</option><option value={250}>{formatNumber(250)} entries</option><option value={500}>{formatNumber(500)} entries</option><option value={1000}>{formatNumber(1000)} entries</option><option value={2500}>{formatNumber(2500)} entries</option><option value={5000}>{formatNumber(5000)} entries</option></select></label>
           <label className="field-label">Export format<span className="field-hint">Default for quick exports</span><select value={settings.exportFormat} disabled={!!active} onChange={(event) => updateSettings({ exportFormat: event.target.value as "TXT" | "CSV" })}><option value="TXT">TXT — one number per line</option><option value="CSV">CSV — spreadsheet ready</option></select></label>
         </div>
-        <label className="toggle-row"><div className="toggle-copy"><strong>Avoid duplicates</strong><span>Skip numbers already stored on this device.</span></div><input type="checkbox" checked={settings.avoidDuplicates} disabled={!!active} onChange={(event) => updateSettings({ avoidDuplicates: event.target.checked })} /><span className="toggle-control" /></label>
+        <div className={`master-readiness ${masterInfo.initialized ? "ready" : "missing"}`}>
+          <Database size={16} />
+          <span>{masterInfo.initialized
+            ? `Master loaded · ${formatNumber(masterInfo.count)} unique numbers. New numbers are checked against and added to it.`
+            : "Import the master file before generating numbers."}</span>
+          {!masterInfo.initialized && <button className="text-button" onClick={onOpenSettings}>Import master →</button>}
+        </div>
         <div className="format-note"><CircleHelp size={15} /><span>Synthetic format only; a generated value may match a real number. Do not call or message these entries.</span></div>
         {active ? <div className="active-controls">
           <div className="progress-header"><span>{progress.paused ? "Generation paused" : "Generating your numbers"}</span><strong>{percentComplete}%</strong></div>
           <ProgressBar value={percentComplete} />
           <div className="progress-stats"><span><strong>{formatNumber(progress.done)}</strong> / {formatNumber(active.session.requested)} entries</span><span>{formatNumber(progress.speed)} / sec</span></div>
+          <div className="progress-stats duplicate-stats"><span>{formatNumber(progress.skipped)} duplicate candidates skipped</span><span>Unique results only</span></div>
           <div className="control-buttons">
             {progress.paused ? <button className="secondary-button" onClick={resume}><Play size={16} /> Resume</button> : <button className="secondary-button" onClick={pause}><Pause size={16} /> Pause</button>}
             <button className="danger-outline" onClick={cancel}><X size={16} /> Cancel generation</button>
           </div>
-        </div> : <button className="primary-button full-button" onClick={start}><Plus size={17} /> Generate {formatNumber(settings.quantity || 0)} numbers <span>→</span></button>}
+        </div> : <button className="primary-button full-button" disabled={!masterInfo.initialized || masterImporting} onClick={start}><Plus size={17} /> Generate {formatNumber(settings.quantity || 0)} numbers <span>→</span></button>}
         <div className="local-note"><ShieldCheck size={17} /><div><strong>Everything stays local</strong><span>Your numbers never leave this browser or device.</span></div></div>
       </section>
       <aside className="generate-aside">
         <div className="panel quick-tip"><div className="tip-icon"><Smartphone size={19} /></div><p className="eyebrow">BUILT FOR YOUR PHONE</p><h3>Works beautifully on iPhone.</h3><p>Install this app from Safari to keep your number workspace one tap away—even offline.</p><div className="tip-footer"><span>HOME SCREEN READY</span><ArrowDownToLine size={15} /></div></div>
-        <div className="panel generation-facts"><p className="eyebrow">BATCH DETAILS</p><div className="fact-row"><span>Country code</span><strong>+{settings.countryCode || "—"}</strong></div><div className="fact-row"><span>Requested volume</span><strong>{formatNumber(settings.quantity || 0)}</strong></div><div className="fact-row"><span>Duplicate check</span><strong>{settings.avoidDuplicates ? "On" : "Off"}</strong></div></div>
+        <div className="panel generation-facts"><p className="eyebrow">BATCH DETAILS</p><div className="fact-row"><span>Country code</span><strong>+{settings.countryCode || "—"}</strong></div><div className="fact-row"><span>Requested volume</span><strong>{formatNumber(settings.quantity || 0)}</strong></div><div className="fact-row"><span>Duplicate check</span>        <strong>Always on</strong></div></div>
       </aside>
     </div>
     </TranslateTree>
@@ -623,19 +779,68 @@ function ExportPage({ sessions, selectedId, setSelectedId, format, setFormat, on
   </section><aside className="panel export-guide"><div className="guide-badge"><FileText size={20} /></div><p className="eyebrow">FORMATS, SIMPLIFIED</p><h3>Made for wherever your work takes you.</h3><div className="guide-item"><span className="guide-bullet">01</span><div><strong>TXT</strong><p>Simple, lightweight, and easy to share. One phone number on each line.</p></div></div><div className="guide-item"><span className="guide-bullet">02</span><div><strong>CSV</strong><p>Opens cleanly in Excel, Numbers, and Google Sheets with a phone_number column.</p></div></div><div className="privacy-inline"><ShieldCheck size={16} /><span>Exports are created on your device</span></div></aside></div></TranslateTree>;
 }
 
-function SettingsPage({ settings, updateSettings, onDeleteAll, totalEntries }: {
+function SettingsPage({
+  settings, updateSettings, onDeleteAll, totalEntries, masterInfo, masterImport, onImportMaster,
+  masterExporting, masterExportProgress, onExportMaster
+}: {
   settings: GeneratorSettings;
   updateSettings: (patch: Partial<GeneratorSettings>) => void;
   onDeleteAll: () => void;
   totalEntries: number;
+  masterInfo: MasterInfo;
+  masterImport: MasterImportProgress | null;
+  onImportMaster: (file: File) => void;
+  masterExporting: boolean;
+  masterExportProgress: number;
+  onExportMaster: () => void;
 }) {
+  const masterFileInput = useRef<HTMLInputElement>(null);
+  const importPercent = masterImport?.totalBytes
+    ? Math.min(100, Math.round((masterImport.bytesRead / masterImport.totalBytes) * 100))
+    : 0;
   return <TranslateTree><div className="settings-layout"><section className="panel settings-panel"><div className="panel-header"><div><p className="eyebrow">PERSONALIZE YOUR WORKSPACE</p><h3>Generation defaults</h3></div><div className="setting-icon"><SettingsIcon size={17} /></div></div>
     <label className="settings-row"><div><strong>Default country code</strong><span>Used as the prefix for every generated number.</span></div><div className="compact-input"><span>+</span><input inputMode="numeric" maxLength={4} value={settings.countryCode} onChange={(event) => updateSettings({ countryCode: event.target.value.replace(/\D/g, "") })} /></div></label>
     <label className="settings-row"><div><strong>Default batch quantity</strong><span>Number of entries created in a generation session.</span></div><input className="small-number" type="number" min={1} max={2_000_000} value={settings.quantity} onChange={(event) => updateSettings({ quantity: Number(event.target.value) })} /></label>
     <label className="settings-row"><div><strong>Default batch size</strong><span>Records processed per worker cycle.</span></div><select className="small-select" value={settings.batchSize} onChange={(event) => updateSettings({ batchSize: Number(event.target.value) })}><option value={100}>{formatNumber(100)}</option><option value={250}>{formatNumber(250)}</option><option value={500}>{formatNumber(500)}</option><option value={1000}>{formatNumber(1000)}</option><option value={2500}>{formatNumber(2500)}</option><option value={5000}>{formatNumber(5000)}</option></select></label>
-    <label className="settings-row"><div><strong>Avoid duplicate numbers</strong><span>Check existing stored data before saving.</span></div><input type="checkbox" checked={settings.avoidDuplicates} onChange={(event) => updateSettings({ avoidDuplicates: event.target.checked })} /><span className="toggle-control" /></label>
     <label className="settings-row"><div><strong>Default export format</strong><span>Choose your preferred download format.</span></div><select className="small-select" value={settings.exportFormat} onChange={(event) => updateSettings({ exportFormat: event.target.value as "TXT" | "CSV" })}><option value="TXT">TXT</option><option value="CSV">CSV</option></select></label>
-  </section><section className="panel data-panel"><div className="panel-header"><div><p className="eyebrow">DEVICE STORAGE</p><h3>Your data, your choice</h3></div><div className="setting-icon green"><ShieldCheck size={17} /></div></div><div className="data-summary"><Database size={18} /><div><strong>{formatNumber(totalEntries)} entries</strong><span>Saved in this browser's IndexedDB</span></div></div><div className="danger-zone"><div><strong>Delete all generated data</strong><span>Remove every entry and clear your session history.</span></div><button className="danger-button" onClick={onDeleteAll}><Trash2 size={15} /> Delete all</button></div><div className="data-policy"><ShieldCheck size={17} /><p><strong>Local-first by default</strong><br />No analytics, accounts, or network uploads. Your generated data stays on this device.</p></div></section></div></TranslateTree>;
+  </section>
+  <section className="panel master-panel">
+    <div className="panel-header"><div><p className="eyebrow">PRIVATE LOCAL MASTER</p><h3>Master number file</h3></div><div className="setting-icon"><Database size={17} /></div></div>
+    <div className="data-summary"><Database size={18} /><div><strong>{formatNumber(masterInfo.count)} unique numbers</strong><span>{masterInfo.initialized ? "Ready for duplicate checks on this device" : "Import the existing master file to enable generation"}</span></div></div>
+    <p className="master-description">Select the TXT master file from this device. It is read in chunks, merged into IndexedDB, and never uploaded. One phone number per line; repeated numbers are ignored.</p>
+    <input
+      ref={masterFileInput}
+      className="master-file-input"
+      type="file"
+      accept=".txt,text/plain"
+      aria-label="Select master number file"
+      disabled={!!masterImport}
+      onChange={(event) => {
+        const file = event.currentTarget.files?.[0];
+        if (file) onImportMaster(file);
+        event.currentTarget.value = "";
+      }}
+    />
+    <button className="secondary-button" disabled={!!masterImport} onClick={() => masterFileInput.current?.click()}>
+      {masterImport ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}
+      {masterImport ? `Importing · ${importPercent}%` : masterInfo.initialized ? "Import or merge another file" : "Choose master file"}
+    </button>
+    {masterImport && <div className="master-import-progress">
+      <div className="progress-caption"><span>{formatBytes(masterImport.bytesRead)} / {formatBytes(masterImport.totalBytes)}</span><strong>{importPercent}%</strong></div>
+      <ProgressBar value={importPercent} />
+      <div className="progress-stats"><span>{formatNumber(masterImport.inserted)} added</span><span>{formatNumber(masterImport.duplicates)} duplicates</span></div>
+    </div>}
+    <div className="master-export">
+      <button className="secondary-button" disabled={!masterInfo.initialized || !!masterImport || masterExporting} onClick={onExportMaster}>
+        {masterExporting ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}
+        {masterExporting ? "Exporting master…" : "Download updated master TXT"}
+      </button>
+      {masterExporting && <div className="master-import-progress"><div className="progress-caption"><span>Writing master file</span><strong>{masterExportProgress}%</strong></div><ProgressBar value={masterExportProgress} /></div>}
+      <p className="master-description">The source file is unchanged. The downloaded master includes all imported and newly generated unique numbers.</p>
+      <p className="master-description">Very large exports need Chrome or Edge on PC; Safari can download smaller master lists.</p>
+    </div>
+  </section>
+  <section className="panel data-panel"><div className="panel-header"><div><p className="eyebrow">DEVICE STORAGE</p><h3>Your data, your choice</h3></div><div className="setting-icon green"><ShieldCheck size={17} /></div></div><div className="data-summary"><Database size={18} /><div><strong>{formatNumber(totalEntries)} generated entries</strong><span>Saved in this browser's IndexedDB</span></div></div><div className="danger-zone"><div><strong>Delete generation history</strong><span>Removes generated session exports. The master list is kept unchanged.</span></div><button className="danger-button" onClick={onDeleteAll}><Trash2 size={15} /> Delete all</button></div><div className="data-policy"><ShieldCheck size={17} /><p><strong>Local-first by default</strong><br />No analytics, accounts, or network uploads. Your generated data stays on this device.</p></div></section></div></TranslateTree>;
 }
 
 function SessionRow({ session }: { session: GenerationSession }) {

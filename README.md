@@ -4,6 +4,16 @@ A local-first Progressive Web App for creating synthetic Italian-format mobile n
 
 The interface defaults to Italian, with English available from the language selector. Language and light/dark appearance preferences are saved in this browser.
 
+## Private master-number file
+
+The large master file belongs in the local `data/` folder and is intentionally excluded from Git and Vercel deployments. Never commit or publish it: a deployed static asset would be downloadable by anyone.
+
+In the app, open **Settings → Master number file** and select the TXT file from the device. Import is streamed in bounded batches; use one phone number per line. The file is merged into a separate IndexedDB master list on that device, with duplicates ignored. Generation is disabled until an import completes. Every generated candidate is checked against this master list, and only new unique numbers are saved to the generation session and appended to the master list in the same local transaction.
+
+The browser cannot modify the original file in `data/`. The IndexedDB list becomes the writable master for that browser/device; the source TXT remains unchanged. Use **Download updated master TXT** to save the complete local master. Very large exports stream directly to disk in Chrome or Edge on PC; browsers without file-stream support can download smaller masters, or you can export generated sessions and merge those additions into the source file on your PC. Import the master separately on each device. Clearing generation history does not remove master numbers.
+
+The master list is private to the browser profile and is not synced to Vercel or other devices. A large import requires adequate browser storage; if storage fills, imported batches remain local and safe, and the same file can be imported again to continue merging.
+
 ## Requirements
 
 - Node.js 20.19+ or 22.12+ (Node 24 is also supported)
@@ -40,7 +50,7 @@ The production files are written to `dist/`. `npm test` runs the automated test 
    git add .
    git commit -m "Initial Italian Number Generator app"
    git branch -M main
-   git remote add origin https://github.com/tc067367-web/iphone-pws.git
+   git remote add origin https://github.com/<USERNAME>/<REPOSITORY>.git
    git push -u origin main
    ```
 
@@ -64,10 +74,10 @@ The service worker caches the application shell for offline reopening. Number da
 
 - Italian-style synthetic mobile numbers use a 10-digit national part beginning with `3`, preceded by the configurable country code (default `39`). They are not checked against carrier allocations and may coincide with real assigned numbers; do not call or message generated entries.
 - Generation is capped at 2,000,000 entries per session and runs in a dedicated Web Worker in batches. The interface displays progress, generation rate, pause/resume, and cancellation.
-- IndexedDB persists sessions and entries on the current device. Duplicate avoidance checks stored entries before insertion; disabling it permits repeated numbers across sessions.
+- IndexedDB persists sessions, generated entries, and the imported master list on the current device. Every generated candidate is checked against the master list; duplicates are always skipped, regardless of earlier generation preferences.
 - Storage capacity is controlled by the browser and device. Large runs may fail if quota is reached; reduce batch size or quantity and free device storage if needed.
 - Avoid duplicate generation sessions: a second session cannot start while one is active. Reloading during generation records the session as interrupted and preserves already-saved batches.
-- No generated entries, telemetry, account data, or settings are transmitted to a server. Vercel hosts static application assets only.
+- No master numbers, generated entries, telemetry, account data, or settings are transmitted to a server. Vercel hosts static application assets only.
 
 ## Project layout
 
@@ -75,6 +85,7 @@ The service worker caches the application shell for offline reopening. Number da
 src/
   App.tsx               Responsive dashboard and application workflows
   db.ts                 IndexedDB persistence and paged reads
+  masterFile.ts         Streamed master TXT parsing
   generation.worker.ts  Batch number generation
   main.tsx              React entry point and PWA registration
   styles.css            Responsive dark dashboard and iPhone safe areas
