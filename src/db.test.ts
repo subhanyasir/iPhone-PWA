@@ -15,6 +15,23 @@ describe("local generation data workflow", () => {
     const defaults = await database.getSettings();
     expect(defaults.countryCode).toBe("39");
 
+    const legacyDatabase = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("italian-number-generator", 2);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const legacyTx = legacyDatabase.transaction("masterNumbers", "readwrite");
+    legacyTx.objectStore("masterNumbers").put({ number: "393331234567" });
+    await new Promise<void>((resolve, reject) => {
+      legacyTx.oncomplete = () => resolve();
+      legacyTx.onerror = () => reject(legacyTx.error);
+      legacyTx.onabort = () => reject(legacyTx.error);
+    });
+    expect(await database.countLegacyMasterNumbers()).toBe(1);
+    expect(await database.clearLegacyMasterNumbers()).toBe(1);
+    expect(await database.countLegacyMasterNumbers()).toBe(0);
+    legacyDatabase.close();
+
     const settings: GeneratorSettings = { ...defaults, countryCode: "39", quantity: 1300, batchSize: 500 };
     await database.saveSettings(settings);
     expect(await database.getSettings()).toEqual(settings);
@@ -33,13 +50,9 @@ describe("local generation data workflow", () => {
     };
     await database.createSession(session);
     const numbers = Array.from({ length: 1300 }, (_, index) => `39${3_000_000_000 + index}`);
-    expect(await database.importMasterBatch([numbers[0], numbers[1], numbers[1]])).toEqual({ inserted: 2, skipped: 1 });
-    expect(await database.saveBatch(session.id, numbers)).toEqual({ inserted: 1298, skipped: 2 });
+    expect(await database.saveBatch(session.id, numbers)).toEqual({ inserted: 1300, skipped: 0 });
     expect(await database.saveBatch(session.id, numbers.slice(0, 3))).toEqual({ inserted: 0, skipped: 3 });
-    expect(await database.countEntries()).toBe(1298);
-    expect((await database.getMasterInfo()).count).toBe(1300);
-    await database.markMasterInitialized("fixture.txt");
-    expect((await database.getMasterInfo()).initialized).toBe(true);
+    expect(await database.countEntries()).toBe(1300);
 
     const chunkSizes: number[] = [];
     const streamed: string[] = [];
@@ -47,27 +60,17 @@ describe("local generation data workflow", () => {
       chunkSizes.push(chunk.length);
       streamed.push(...chunk);
     }, 500);
-    expect(streamedCount).toBe(1298);
-    expect(chunkSizes).toEqual([500, 500, 298]);
-    expect(streamed[0]).toBe(numbers[2]);
+    expect(streamedCount).toBe(1300);
+    expect(chunkSizes).toEqual([500, 500, 300]);
+    expect(streamed[0]).toBe(numbers[0]);
     expect(streamed.at(-1)).toBe(numbers.at(-1));
-
-    const masterPages: number[] = [];
-    const masterValues: string[] = [];
-    expect(await database.streamMaster(async (chunk) => {
-      masterPages.push(chunk.length);
-      masterValues.push(...chunk);
-    }, 500)).toBe(1300);
-    expect(masterPages).toEqual([500, 500, 300]);
-    expect(masterValues).toContain(numbers[0]);
 
     await database.updateSession({ ...session, generated: streamedCount, status: "complete" });
     expect((await database.getSessions())[0].status).toBe("complete");
     await database.deleteSession(session.id);
     expect(await database.countEntries()).toBe(0);
     expect(await database.getSessions()).toHaveLength(0);
-    expect((await database.saveBatch("later-session", [numbers[0]])).skipped).toBe(1);
-    expect((await database.getMasterInfo()).count).toBe(1300);
+    expect(await database.saveBatch("later-session", [numbers[0]])).toEqual({ inserted: 1, skipped: 0 });
   });
 
   it("formats TXT and CSV chunks while preserving the country prefix", () => {

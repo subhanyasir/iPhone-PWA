@@ -1,18 +1,20 @@
-import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import {
-  Activity, ArrowDownToLine, BarChart3, Check, ChevronDown, CircleHelp, Clock3, Database,
-  Download, FileText, HardDrive, History, Home, LoaderCircle, Moon, Pause, Play, Plus,
+  Activity, ArrowDownToLine, BarChart3, Check, CircleHelp, Clock3, Database,
+  Download, FileText, HardDrive, History, Home, LoaderCircle, LogOut, Moon, Pause, Play, Plus,
   Radio, Settings as SettingsIcon, ShieldCheck, Smartphone, Sun, Trash2, TriangleAlert, X
 } from "lucide-react";
 import {
-  countEntries, createSession, deleteAllData, deleteSession, estimateStorage, getMasterInfo, getSessionEntryCount,
-  getSessions, getSettings, importMasterBatch, markInterruptedSessions, markMasterInitialized, saveBatch, saveSettings, streamMaster, streamSession, updateSession
+  clearLegacyMasterNumbers, countEntries, countLegacyMasterNumbers, createSession, deleteAllData,
+  deleteSession, estimateStorage, getSessionEntryCount, getSessions, getSettings,
+  markInterruptedSessions, saveBatch, saveSettings, streamSession, updateSession
 } from "./db";
-import type { MasterInfo } from "./db";
 import type { GenerationSession, GeneratorSettings, Section, SessionStatus } from "./types";
 import { exportHeader, formatExportChunk } from "./exportFormat";
 import { formatLocale, translateText, type Locale } from "./i18n";
-import { processMasterFile } from "./masterFile";
+import { addUniqueCandidates, getMasterInfo, MasterAccessError, type MasterInfo } from "./masterApi";
+import { supabase } from "./supabase";
+import type { Session } from "@supabase/supabase-js";
 
 const navigation: { name: Section; icon: typeof Home }[] = [
   { name: "Dashboard", icon: Home },
@@ -49,15 +51,6 @@ interface ActiveGeneration {
   pendingSave?: Promise<void>;
 }
 
-interface MasterImportProgress {
-  fileName: string;
-  bytesRead: number;
-  totalBytes: number;
-  inserted: number;
-  duplicates: number;
-  invalid: number;
-}
-
 function App() {
   const [locale, setLocale] = useState<Locale>(() => localStorage.getItem("numero-locale") === "en" ? "en" : "it");
   const [theme, setTheme] = useState<"dark" | "light">(() => localStorage.getItem("numero-theme") === "light" ? "light" : "dark");
@@ -67,9 +60,7 @@ function App() {
   const [totalEntries, setTotalEntries] = useState(0);
   const [storage, setStorage] = useState<{ usage?: number; quota?: number }>({});
   const [masterInfo, setMasterInfo] = useState<MasterInfo>({ count: 0, initialized: false });
-  const [masterImport, setMasterImport] = useState<MasterImportProgress | null>(null);
-  const [masterExporting, setMasterExporting] = useState(false);
-  const [masterExportProgress, setMasterExportProgress] = useState(0);
+  const [legacyMasterCount, setLegacyMasterCount] = useState(0);
   const [active, setActive] = useState<ActiveGeneration | null>(null);
   const [progress, setProgress] = useState({ done: 0, skipped: 0, speed: 0, paused: false, startedAt: 0 });
   const [selectedExportId, setSelectedExportId] = useState("");
@@ -79,6 +70,9 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [authSession, setAuthSession] = useState<Session | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [masterAccessDenied, setMasterAccessDenied] = useState(false);
   const activeRef = useRef<ActiveGeneration | null>(null);
   const cancelRef = useRef(false);
   const generationErrorRef = useRef(false);
@@ -90,8 +84,8 @@ function App() {
     document.querySelector<HTMLMetaElement>('meta[name="description"]')?.setAttribute(
       "content",
       locale === "it"
-        ? "Genera numeri di prova in formato italiano, in modo privato e direttamente sul tuo dispositivo."
-        : "Generate Italian-format test phone numbers privately on your device."
+        ? "Genera numeri sintetici in formato italiano e controllali rispetto all'archivio privato condiviso."
+        : "Generate synthetic Italian-format numbers and check them against the private shared master."
     );
     document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.setAttribute(
       "content",
@@ -102,16 +96,49 @@ function App() {
   }, [locale, theme]);
 
   const refresh = useCallback(async () => {
-    const [nextSessions, entries, nextStorage, nextMasterInfo] = await Promise.all([
-      getSessions(), countEntries(), estimateStorage(), getMasterInfo()
+    if (!supabase) throw new Error("Supabase is not configured.");
+    const [nextSessions, entries, nextStorage, nextMasterInfo, nextLegacyCount] = await Promise.all([
+      getSessions(), countEntries(), estimateStorage(), getMasterInfo(supabase), countLegacyMasterNumbers()
     ]);
     setSessions(nextSessions);
     setTotalEntries(entries);
     setStorage(nextStorage);
     setMasterInfo(nextMasterInfo);
+    setLegacyMasterCount(nextLegacyCount);
   }, []);
 
   useEffect(() => {
+    if (!supabase) {
+      setAuthLoading(false);
+      setLoading(false);
+      return;
+    }
+    let mounted = true;
+    void supabase.auth.getSession()
+      .then(({ data, error: sessionError }) => {
+        if (!mounted) return;
+        if (sessionError) setError(`Could not restore sign-in: ${sessionError.message}`);
+        setAuthSession(data.session);
+      })
+      .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : "Could not restore sign-in."))
+      .finally(() => mounted && setAuthLoading(false));
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === "SIGNED_IN" || event === "SIGNED_OUT") setMasterAccessDenied(false);
+      setAuthSession(session);
+      setAuthLoading(false);
+    });
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!authSession) {
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
     let mounted = true;
     Promise.all([markInterruptedSessions(), getSettings()])
       .then(async ([, savedSettings]) => {
@@ -119,13 +146,16 @@ function App() {
         setSettings(savedSettings);
         await refresh();
       })
-      .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : "Could not load local data."))
+      .catch((cause: unknown) => {
+        if (cause instanceof MasterAccessError) setMasterAccessDenied(true);
+        else setError(cause instanceof Error ? cause.message : "Could not load local data.");
+      })
       .finally(() => mounted && setLoading(false));
     return () => {
       mounted = false;
       if (activeRef.current) activeRef.current.worker.terminate();
     };
-  }, [refresh]);
+  }, [refresh, authSession?.user.id]);
 
   const currentSession = active?.session;
   const latestSession = sessions[0];
@@ -140,48 +170,13 @@ function App() {
     void saveSettings(next).catch((cause: unknown) => setError(cause instanceof Error ? cause.message : "Could not save settings."));
   };
 
-  const importMasterFile = async (file: File) => {
-    if (activeRef.current) {
-      setError("Cancel the active generation before importing a master file.");
-      return;
-    }
-    if (masterImport) return;
-    setError("");
-    setNotice("");
-    setMasterImport({
-      fileName: file.name,
-      bytesRead: 0,
-      totalBytes: file.size,
-      inserted: 0,
-      duplicates: 0,
-      invalid: 0
-    });
-    let inserted = 0;
-    let duplicates = 0;
+  const signOut = async () => {
+    if (!supabase) return;
     try {
-      const result = await processMasterFile(file, async (numbers) => {
-        const batchResult = await importMasterBatch(numbers);
-        inserted += batchResult.inserted;
-        duplicates += batchResult.skipped;
-        setMasterImport((current) => current ? { ...current, inserted, duplicates } : current);
-      }, (bytesRead) => {
-        setMasterImport((current) => current ? { ...current, bytesRead } : current);
-      });
-      if (result.valid === 0) throw new Error("No valid phone numbers were found. Use a text file with one phone number per line.");
-      await markMasterInitialized(file.name);
-      setMasterImport((current) => current ? { ...current, invalid: result.invalid } : current);
-      await refresh();
-      setNotice(`Master imported: ${formatNumber(inserted)} new numbers; ${formatNumber(duplicates)} duplicate values skipped; ${formatNumber(result.invalid)} invalid lines skipped.`);
+      const { error: signOutError } = await supabase.auth.signOut();
+      if (signOutError) throw signOutError;
     } catch (cause) {
-      const isQuotaError = cause instanceof DOMException && cause.name === "QuotaExceededError";
-      setError(isQuotaError
-        ? "Device storage is full. The import stopped; already imported numbers remain safe. Free browser storage and import the file again."
-        : cause instanceof Error ? cause.message : "Could not import the master file.");
-      await refresh().catch((refreshCause: unknown) => {
-        setError(refreshCause instanceof Error ? refreshCause.message : "Could not refresh local data.");
-      });
-    } finally {
-      setMasterImport(null);
+      setError(cause instanceof Error ? `Could not sign out: ${cause.message}` : "Could not sign out.");
     }
   };
 
@@ -201,17 +196,17 @@ function App() {
   const startGeneration = async () => {
     setError("");
     setNotice("");
-    if (masterImport) {
-      setError("Wait for the master file import to finish before generating numbers.");
-      return;
-    }
     if (activeRef.current) {
       setError("A generation session is already active. Finish or cancel it before starting another.");
       return;
     }
+    const client = supabase;
+    if (!client || !authSession) {
+      setError("Sign in to the private master before generating numbers.");
+      return;
+    }
     if (!masterInfo.initialized) {
-      setError("Import your master file before generating numbers.");
-      setSection("Settings");
+      setError("Import and verify the shared master before generating numbers.");
       return;
     }
     if (!/^\d{1,4}$/.test(settings.countryCode)) {
@@ -255,14 +250,14 @@ function App() {
           const batch = event.data.numbers;
           current.pendingSave = (async () => {
             try {
-              const { inserted, skipped } = await saveBatch(session.id, batch);
+              const insertedNumbers = await addUniqueCandidates(client, batch);
+              const { inserted } = await saveBatch(session.id, insertedNumbers);
+              const skipped = batch.length - inserted;
               current.session = { ...current.session, generated: current.session.generated + inserted, updatedAt: Date.now() };
               await updateSession(current.session);
               setProgress((previous) => ({ ...previous, done: current.session.generated, skipped: previous.skipped + skipped }));
-              if (inserted > 0) {
-                setTotalEntries((previous) => previous + inserted);
-                setMasterInfo((previous) => ({ ...previous, count: previous.count + inserted }));
-              }
+              if (inserted > 0) setTotalEntries((previous) => previous + inserted);
+              setMasterInfo((previous) => ({ ...previous, count: previous.count + insertedNumbers.length }));
               if (cancelRef.current) current.worker.postMessage({ type: "cancel" });
               else current.worker.postMessage({ type: "ack", inserted });
             } catch (cause) {
@@ -384,64 +379,6 @@ function App() {
     }
   };
 
-  const downloadMaster = async () => {
-    setError("");
-    setNotice("");
-    setMasterExporting(true);
-    setMasterExportProgress(0);
-    let writable: FileSystemWritableFileStream | undefined;
-    const parts: BlobPart[] = [];
-    let exported = 0;
-    try {
-      const pickerWindow = window as Window & {
-        showSaveFilePicker?: (options: {
-          suggestedName: string;
-          types: { description: string; accept: Record<string, string[]> }[];
-        }) => Promise<{ createWritable: () => Promise<FileSystemWritableFileStream> }>;
-      };
-      if (pickerWindow.showSaveFilePicker) {
-        const handle = await pickerWindow.showSaveFilePicker({
-          suggestedName: "italian-number-master.txt",
-          types: [{ description: "TXT file", accept: { "text/plain": [".txt"] } }]
-        });
-        writable = await handle.createWritable();
-      } else if (masterInfo.count * 16 > 64 * 1024 * 1024) {
-        throw new Error("This browser cannot safely download a master file this large. Use Chrome or Edge on your PC to stream the updated master to disk.");
-      }
-
-      await streamMaster(async (numbers) => {
-        const text = formatExportChunk(numbers, "TXT");
-        if (writable) await writable.write(text);
-        else parts.push(text);
-        exported += numbers.length;
-        setMasterExportProgress(masterInfo.count
-          ? Math.min(100, Math.round((exported / masterInfo.count) * 100))
-          : 100);
-      });
-
-      if (writable) await writable.close();
-      else {
-        const blob = new Blob(parts, { type: "text/plain;charset=utf-8" });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.href = url;
-        link.download = "italian-number-master.txt";
-        document.body.append(link);
-        link.click();
-        link.remove();
-        window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-      }
-      setNotice(`Master file exported: ${formatNumber(exported)} unique numbers.`);
-    } catch (cause) {
-      if (writable) await writable.abort().catch(() => undefined);
-      if (cause instanceof DOMException && cause.name === "AbortError") setNotice("Export cancelled.");
-      else setError(cause instanceof Error ? cause.message : "Export failed.");
-    } finally {
-      setMasterExporting(false);
-      setMasterExportProgress(0);
-    }
-  };
-
   const removeSession = async (session: GenerationSession) => {
     if (!window.confirm(translateText(`Delete ${formatNumber(session.generated)} entries from this session? This cannot be undone.`, locale))) return;
     try {
@@ -464,13 +401,36 @@ function App() {
     }
   };
 
+  const clearLegacyMaster = async () => {
+    if (!masterInfo.initialized) {
+      setError("Import and verify the shared master before clearing the old local master copy.");
+      return;
+    }
+    if (!window.confirm(translateText("Clear the old local master copy? This will not affect the shared master or generation history.", locale))) return;
+    setError("");
+    try {
+      const count = await clearLegacyMasterNumbers();
+      setLegacyMasterCount(0);
+      setStorage(await estimateStorage());
+      setNotice(`${formatNumber(count)} old local master numbers removed. The shared master is unchanged.`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not clear the old local master.");
+    }
+  };
+
   const exportableSessions = useMemo(() => sessions.filter((session) => session.generated > 0), [sessions]);
+  if (!supabase) return <LocaleContext.Provider value={locale}><TranslateTree><ConfigurationRequired locale={locale} onLocaleChange={setLocale} theme={theme} /></TranslateTree></LocaleContext.Provider>;
+  if (authLoading) return <LocaleContext.Provider value={locale}><TranslateTree><div className="auth-page"><div className="panel auth-card"><LoaderCircle className="spin" size={22} /> Checking sign-in…</div></div></TranslateTree></LocaleContext.Provider>;
+  if (!authSession) return <LocaleContext.Provider value={locale}><TranslateTree><SignInPage locale={locale} onLocaleChange={setLocale} theme={theme} /></TranslateTree></LocaleContext.Provider>;
+  if (masterAccessDenied) return <LocaleContext.Provider value={locale}><TranslateTree><AccessDenied locale={locale} onLocaleChange={setLocale} theme={theme} onSignOut={() => void signOut()} error={error} /></TranslateTree></LocaleContext.Provider>;
+
   const content = () => {
     if (loading) return <div className="loading-state"><LoaderCircle className="spin" size={22} /> Loading your local workspace…</div>;
     switch (section) {
       case "Dashboard":
         return <Dashboard
           totalEntries={totalEntries}
+          masterInfo={masterInfo}
           sessions={sessions}
           storage={storage}
           active={active}
@@ -482,7 +442,6 @@ function App() {
           settings={settings}
           updateSettings={updateSettings}
           masterInfo={masterInfo}
-          masterImporting={!!masterImport}
           active={active}
           progress={{ ...progress, speed }}
           percentComplete={percentComplete}
@@ -490,7 +449,6 @@ function App() {
           pause={pauseGeneration}
           resume={resumeGeneration}
           cancel={cancelGeneration}
-          onOpenSettings={() => setSection("Settings")}
         />;
       case "History":
         return <HistoryPage sessions={sessions} onExport={downloadSession} onDelete={removeSession} exporting={exporting} />;
@@ -512,11 +470,8 @@ function App() {
           onDeleteAll={removeAll}
           totalEntries={totalEntries}
           masterInfo={masterInfo}
-          masterImport={masterImport}
-          onImportMaster={importMasterFile}
-          masterExporting={masterExporting}
-          masterExportProgress={masterExportProgress}
-          onExportMaster={downloadMaster}
+          legacyMasterCount={legacyMasterCount}
+          onClearLegacyMaster={clearLegacyMaster}
         />;
     }
   };
@@ -540,8 +495,8 @@ function App() {
           ))}
         </nav>
         <div className="sidebar-bottom">
-          <div className="privacy-card"><ShieldCheck size={18} /><div><strong>Private by design</strong><small>Your data stays on this device.</small></div></div>
-          <div className="sidebar-foot">ITALY · LOCAL STORAGE</div>
+          <div className="privacy-card"><ShieldCheck size={18} /><div><strong>Private by design</strong><small>Shared master is protected by sign-in.</small></div></div>
+          <div className="sidebar-foot">PRIVATE MASTER · SUPABASE</div>
         </div>
       </aside>
 
@@ -571,7 +526,8 @@ function App() {
             >
               {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
             </button>
-            <div className="top-status"><span className="status-dot" /> Local database <ChevronDown size={14} /></div>
+            <div className="top-status"><span className="status-dot" /> {authSession.user.email}</div>
+            <button className="sign-out-button" onClick={() => void signOut()} aria-label="Sign out" title="Sign out"><LogOut size={15} /></button>
           </div>
         </header>
         <main className="main-content">
@@ -583,7 +539,7 @@ function App() {
           {notice && <div role="status" className="message success-message"><Check size={18} /><span>{notice}</span><button aria-label="Dismiss message" onClick={() => setNotice("")}><X size={16} /></button></div>}
           {content()}
         </main>
-        <footer className="footer-note"><ShieldCheck size={14} /> Data is stored locally in this browser and never sent to a server.</footer>
+        <footer className="footer-note"><ShieldCheck size={14} /> Master data is private in Supabase; session exports and preferences stay on this device.</footer>
       </div>
 
       <nav className="mobile-nav" aria-label="Mobile navigation">
@@ -598,6 +554,75 @@ function App() {
     </TranslateTree>
     </LocaleContext.Provider>
   );
+}
+
+function AuthLanguage({ locale, onLocaleChange }: { locale: Locale; onLocaleChange: (locale: Locale) => void }) {
+  return <TranslateTree><select className="auth-language" aria-label="Select language" value={locale} onChange={(event) => onLocaleChange(event.target.value as Locale)}>
+    <option value="it">Italiano</option><option value="en">English</option>
+  </select></TranslateTree>;
+}
+
+function ConfigurationRequired({ locale, onLocaleChange, theme }: { locale: Locale; onLocaleChange: (locale: Locale) => void; theme: "dark" | "light" }) {
+  return <TranslateTree><div className="auth-page" data-theme={theme}><AuthLanguage locale={locale} onLocaleChange={onLocaleChange} /><section className="panel auth-card">
+    <div className="brand-mark">N<span>.</span></div>
+    <p className="eyebrow">PRIVATE MASTER SETUP</p>
+    <h1>Connect Supabase</h1>
+    <p>Configure the public Supabase URL and publishable key in local and Vercel environment settings, then rebuild and redeploy.</p>
+    <p className="auth-warning">Use only the publishable/anon key in the app. Never put a service-role key or database password in a public Vite variable.</p>
+    <div className="auth-code"><code>VITE_SUPABASE_URL</code><code>VITE_SUPABASE_ANON_KEY</code></div>
+  </section></div></TranslateTree>;
+}
+
+function SignInPage({ locale, onLocaleChange, theme }: { locale: Locale; onLocaleChange: (locale: Locale) => void; theme: "dark" | "light" }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+
+  const signIn = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!supabase) return;
+    setError("");
+    setSubmitting(true);
+    try {
+      const { error: signInError } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
+      if (signInError) throw signInError;
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Sign-in failed.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return <TranslateTree><div className="auth-page" data-theme={theme}><AuthLanguage locale={locale} onLocaleChange={onLocaleChange} /><section className="panel auth-card">
+    <div className="brand-mark">N<span>.</span></div>
+    <p className="eyebrow">PRIVATE MASTER ACCESS</p>
+    <h1>Sign in</h1>
+    <p>Sign in with the account authorized for your private number master.</p>
+    {error && <div role="alert" className="message error-message">{error}</div>}
+    <form className="auth-form" onSubmit={(event) => void signIn(event)}>
+      <label className="field-label">Email<input type="email" autoComplete="username" required value={email} onChange={(event) => setEmail(event.target.value)} /></label>
+      <label className="field-label">Password<input type="password" autoComplete="current-password" required value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+      <button className="primary-button full-button" type="submit" disabled={submitting}>{submitting ? "Signing in…" : "Sign in securely"}</button>
+    </form>
+  </section></div></TranslateTree>;
+}
+
+function AccessDenied({ locale, onLocaleChange, theme, onSignOut, error }: {
+  locale: Locale;
+  onLocaleChange: (locale: Locale) => void;
+  theme: "dark" | "light";
+  onSignOut: () => void;
+  error: string;
+}) {
+  return <TranslateTree><div className="auth-page" data-theme={theme}><AuthLanguage locale={locale} onLocaleChange={onLocaleChange} /><section className="panel auth-card">
+    <div className="brand-mark">N<span>.</span></div>
+    <p className="eyebrow">PRIVATE MASTER ACCESS</p>
+    <h1>Account not authorized</h1>
+    <p>This signed-in account is not on the private master access list. Ask the owner to authorize its Supabase user ID, or sign out and use the authorized account.</p>
+    {error && <div role="alert" className="message error-message">{error}</div>}
+    <button className="secondary-button full-button" onClick={onSignOut}><LogOut size={16} /> Sign out</button>
+  </section></div></TranslateTree>;
 }
 
 function TranslateTree({ children }: { children: ReactNode }) {
@@ -619,9 +644,10 @@ function TranslateTree({ children }: { children: ReactNode }) {
 }
 
 function Dashboard({
-  totalEntries, sessions, storage, active, latestSession, onNavigate
+  totalEntries, masterInfo, sessions, storage, active, latestSession, onNavigate
 }: {
   totalEntries: number;
+  masterInfo: MasterInfo;
   sessions: GenerationSession[];
   storage: { usage?: number; quota?: number };
   active: ActiveGeneration | null;
@@ -634,22 +660,22 @@ function Dashboard({
     <>
       <section className="welcome-card">
         <div className="welcome-copy">
-          <div className="welcome-chip"><span className="status-dot" /> DEVICE-ONLY GENERATION</div>
+          <div className="welcome-chip"><span className="status-dot" /> PRIVATE SHARED GENERATION</div>
           <h2>Numbers, made<br /><em>effortlessly.</em></h2>
-          <p>Generate Italian-format test data in seconds. Private, organized, and always on your device.</p>
+          <p>Generate synthetic Italian-format numbers. Your private master keeps duplicates out across your signed-in devices.</p>
           <button className="primary-button" onClick={() => onNavigate("Generate")}><Plus size={17} /> Start generating <span>→</span></button>
         </div>
         <div className="welcome-visual" aria-hidden="true">
           <div className="orb orb-one" /><div className="orb orb-two" />
-          <div className="phone-card"><div className="phone-top"><span /><span /></div>          <div className="phone-number">+39 3XX XXX XXXX</div><div className="phone-line" /><div className="phone-label">GENERATED LOCALLY</div><div className="phone-badge"><Check size={13} /> Ready to use</div></div>
+          <div className="phone-card"><div className="phone-top"><span /><span /></div>          <div className="phone-number">+39 3XX XXX XXXX</div><div className="phone-line" /><div className="phone-label">PRIVATE SHARED MASTER</div><div className="phone-badge"><Check size={13} /> Ready to use</div></div>
           <div className="visual-spark spark-a">✳</div><div className="visual-spark spark-b">✳</div>
         </div>
       </section>
 
       <div className="section-title-row"><div><p className="eyebrow">AT A GLANCE</p><h2 className="section-title">Your overview</h2></div><div className="live-tag"><span className="status-dot" /> LIVE</div></div>
       <section className="metric-grid">
-        <MetricCard icon={Database} label="TOTAL GENERATED" value={formatNumber(totalEntries)} detail="Across all sessions" tone="lime" />
-        <MetricCard icon={History} label="GENERATION SESSIONS" value={formatNumber(sessions.length)} detail="Stored in this browser" tone="violet" />
+        <MetricCard icon={Database} label="TOTAL GENERATED" value={formatNumber(totalEntries)} detail="Across all local sessions" tone="lime" />
+        <MetricCard icon={History} label="SHARED MASTER NUMBERS" value={formatNumber(masterInfo.count)} detail={masterInfo.initialized ? "Available across authorized devices" : "Master import not complete"} tone="violet" />
         <MetricCard icon={Activity} label="LAST GENERATION" value={latestSession ? formatDate(latestSession.createdAt).split(",")[0] : "—"} detail={latestSession ? `${formatNumber(latestSession.generated)} entries created` : "Ready for your first batch"} tone="orange" />
         <MetricCard icon={HardDrive} label="LOCAL STORAGE USED" value={formatBytes(storage.usage)} detail={storage.quota ? `of ${formatBytes(storage.quota)} available` : "Browser estimate"} tone="blue" />
       </section>
@@ -664,7 +690,7 @@ function Dashboard({
           <div className="panel-header"><div><p className="eyebrow">GENERATOR</p><h3>Current status</h3></div><span className={`status-pill ${active ? "is-running" : ""}`}><span className="status-dot" />{active ? "RUNNING" : "IDLE"}</span></div>
           {active ? <div className="current-progress"><div className="progress-caption"><span>{formatNumber(active.session.generated)} / {formatNumber(active.session.requested)}</span><strong>{progress}%</strong></div><ProgressBar value={progress} /><p>Processing batch of {formatNumber(active.session.batchSize)} · {active.session.countryCode} prefix</p></div> :
             <div className="idle-state"><div className="idle-icon"><Radio size={20} /></div><strong>All quiet for now</strong><p>Your generator is ready when you are.</p><button className="secondary-button" onClick={() => onNavigate("Generate")}>Configure a batch <span>→</span></button></div>}
-          <div className="privacy-inline"><ShieldCheck size={16} /><span>No server connection required</span></div>
+          <div className="privacy-inline"><ShieldCheck size={16} /><span>Sign in and stay online to check the shared master</span></div>
         </div>
       </section>
     </>
@@ -678,11 +704,10 @@ function MetricCard({ icon: Icon, label, value, detail, tone }: {
   return <TranslateTree><article className="metric-card"><div className={`metric-icon ${tone}`}><Icon size={18} /></div><div className="metric-label">{label}</div><div className="metric-value">{value}</div><div className="metric-detail">{detail}</div></article></TranslateTree>;
 }
 
-function Generate({ settings, updateSettings, masterInfo, masterImporting, active, progress, percentComplete, start, pause, resume, cancel, onOpenSettings }: {
+function Generate({ settings, updateSettings, masterInfo, active, progress, percentComplete, start, pause, resume, cancel }: {
   settings: GeneratorSettings;
   updateSettings: (patch: Partial<GeneratorSettings>) => void;
   masterInfo: MasterInfo;
-  masterImporting: boolean;
   active: ActiveGeneration | null;
   progress: { done: number; skipped: number; speed: number; paused: boolean };
   percentComplete: number;
@@ -690,7 +715,6 @@ function Generate({ settings, updateSettings, masterInfo, masterImporting, activ
   pause: () => void;
   resume: () => void;
   cancel: () => void;
-  onOpenSettings: () => void;
 }) {
   return (
     <TranslateTree>
@@ -706,9 +730,8 @@ function Generate({ settings, updateSettings, masterInfo, masterImporting, activ
         <div className={`master-readiness ${masterInfo.initialized ? "ready" : "missing"}`}>
           <Database size={16} />
           <span>{masterInfo.initialized
-            ? `Master loaded · ${formatNumber(masterInfo.count)} unique numbers. New numbers are checked against and added to it.`
-            : "Import the master file before generating numbers."}</span>
-          {!masterInfo.initialized && <button className="text-button" onClick={onOpenSettings}>Import master →</button>}
+            ? `Shared master ready · ${formatNumber(masterInfo.count)} unique numbers. Candidates are checked and added atomically.`
+            : "Import the master from your PC before generating numbers."}</span>
         </div>
         <div className="format-note"><CircleHelp size={15} /><span>Synthetic format only; a generated value may match a real number. Do not call or message these entries.</span></div>
         {active ? <div className="active-controls">
@@ -720,12 +743,12 @@ function Generate({ settings, updateSettings, masterInfo, masterImporting, activ
             {progress.paused ? <button className="secondary-button" onClick={resume}><Play size={16} /> Resume</button> : <button className="secondary-button" onClick={pause}><Pause size={16} /> Pause</button>}
             <button className="danger-outline" onClick={cancel}><X size={16} /> Cancel generation</button>
           </div>
-        </div> : <button className="primary-button full-button" disabled={!masterInfo.initialized || masterImporting} onClick={start}><Plus size={17} /> Generate {formatNumber(settings.quantity || 0)} numbers <span>→</span></button>}
-        <div className="local-note"><ShieldCheck size={17} /><div><strong>Everything stays local</strong><span>Your numbers never leave this browser or device.</span></div></div>
+        </div> : <button className="primary-button full-button" disabled={!masterInfo.initialized} onClick={start}><Plus size={17} /> Generate {formatNumber(settings.quantity || 0)} numbers <span>→</span></button>}
+        <div className="local-note"><ShieldCheck size={17} /><div><strong>Private shared master</strong><span>Generated candidates are checked securely; session exports stay on this device.</span></div></div>
       </section>
       <aside className="generate-aside">
         <div className="panel quick-tip"><div className="tip-icon"><Smartphone size={19} /></div><p className="eyebrow">BUILT FOR YOUR PHONE</p><h3>Works beautifully on iPhone.</h3><p>Install this app from Safari to keep your number workspace one tap away—even offline.</p><div className="tip-footer"><span>HOME SCREEN READY</span><ArrowDownToLine size={15} /></div></div>
-        <div className="panel generation-facts"><p className="eyebrow">BATCH DETAILS</p><div className="fact-row"><span>Country code</span><strong>+{settings.countryCode || "—"}</strong></div><div className="fact-row"><span>Requested volume</span><strong>{formatNumber(settings.quantity || 0)}</strong></div><div className="fact-row"><span>Duplicate check</span>        <strong>Always on</strong></div></div>
+        <div className="panel generation-facts"><p className="eyebrow">BATCH DETAILS</p><div className="fact-row"><span>Country code</span><strong>+{settings.countryCode || "—"}</strong></div><div className="fact-row"><span>Requested volume</span><strong>{formatNumber(settings.quantity || 0)}</strong></div><div className="fact-row"><span>Duplicate check</span><strong>Always on</strong></div></div>
       </aside>
     </div>
     </TranslateTree>
@@ -779,25 +802,15 @@ function ExportPage({ sessions, selectedId, setSelectedId, format, setFormat, on
   </section><aside className="panel export-guide"><div className="guide-badge"><FileText size={20} /></div><p className="eyebrow">FORMATS, SIMPLIFIED</p><h3>Made for wherever your work takes you.</h3><div className="guide-item"><span className="guide-bullet">01</span><div><strong>TXT</strong><p>Simple, lightweight, and easy to share. One phone number on each line.</p></div></div><div className="guide-item"><span className="guide-bullet">02</span><div><strong>CSV</strong><p>Opens cleanly in Excel, Numbers, and Google Sheets with a phone_number column.</p></div></div><div className="privacy-inline"><ShieldCheck size={16} /><span>Exports are created on your device</span></div></aside></div></TranslateTree>;
 }
 
-function SettingsPage({
-  settings, updateSettings, onDeleteAll, totalEntries, masterInfo, masterImport, onImportMaster,
-  masterExporting, masterExportProgress, onExportMaster
-}: {
+function SettingsPage({ settings, updateSettings, onDeleteAll, totalEntries, masterInfo, legacyMasterCount, onClearLegacyMaster }: {
   settings: GeneratorSettings;
   updateSettings: (patch: Partial<GeneratorSettings>) => void;
   onDeleteAll: () => void;
   totalEntries: number;
   masterInfo: MasterInfo;
-  masterImport: MasterImportProgress | null;
-  onImportMaster: (file: File) => void;
-  masterExporting: boolean;
-  masterExportProgress: number;
-  onExportMaster: () => void;
+  legacyMasterCount: number;
+  onClearLegacyMaster: () => void;
 }) {
-  const masterFileInput = useRef<HTMLInputElement>(null);
-  const importPercent = masterImport?.totalBytes
-    ? Math.min(100, Math.round((masterImport.bytesRead / masterImport.totalBytes) * 100))
-    : 0;
   return <TranslateTree><div className="settings-layout"><section className="panel settings-panel"><div className="panel-header"><div><p className="eyebrow">PERSONALIZE YOUR WORKSPACE</p><h3>Generation defaults</h3></div><div className="setting-icon"><SettingsIcon size={17} /></div></div>
     <label className="settings-row"><div><strong>Default country code</strong><span>Used as the prefix for every generated number.</span></div><div className="compact-input"><span>+</span><input inputMode="numeric" maxLength={4} value={settings.countryCode} onChange={(event) => updateSettings({ countryCode: event.target.value.replace(/\D/g, "") })} /></div></label>
     <label className="settings-row"><div><strong>Default batch quantity</strong><span>Number of entries created in a generation session.</span></div><input className="small-number" type="number" min={1} max={2_000_000} value={settings.quantity} onChange={(event) => updateSettings({ quantity: Number(event.target.value) })} /></label>
@@ -805,42 +818,16 @@ function SettingsPage({
     <label className="settings-row"><div><strong>Default export format</strong><span>Choose your preferred download format.</span></div><select className="small-select" value={settings.exportFormat} onChange={(event) => updateSettings({ exportFormat: event.target.value as "TXT" | "CSV" })}><option value="TXT">TXT</option><option value="CSV">CSV</option></select></label>
   </section>
   <section className="panel master-panel">
-    <div className="panel-header"><div><p className="eyebrow">PRIVATE LOCAL MASTER</p><h3>Master number file</h3></div><div className="setting-icon"><Database size={17} /></div></div>
-    <div className="data-summary"><Database size={18} /><div><strong>{formatNumber(masterInfo.count)} unique numbers</strong><span>{masterInfo.initialized ? "Ready for duplicate checks on this device" : "Import the existing master file to enable generation"}</span></div></div>
-    <p className="master-description">Select the TXT master file from this device. It is read in chunks, merged into IndexedDB, and never uploaded. One phone number per line; repeated numbers are ignored.</p>
-    <input
-      ref={masterFileInput}
-      className="master-file-input"
-      type="file"
-      accept=".txt,text/plain"
-      aria-label="Select master number file"
-      disabled={!!masterImport}
-      onChange={(event) => {
-        const file = event.currentTarget.files?.[0];
-        if (file) onImportMaster(file);
-        event.currentTarget.value = "";
-      }}
-    />
-    <button className="secondary-button" disabled={!!masterImport} onClick={() => masterFileInput.current?.click()}>
-      {masterImport ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}
-      {masterImport ? `Importing · ${importPercent}%` : masterInfo.initialized ? "Import or merge another file" : "Choose master file"}
-    </button>
-    {masterImport && <div className="master-import-progress">
-      <div className="progress-caption"><span>{formatBytes(masterImport.bytesRead)} / {formatBytes(masterImport.totalBytes)}</span><strong>{importPercent}%</strong></div>
-      <ProgressBar value={importPercent} />
-      <div className="progress-stats"><span>{formatNumber(masterImport.inserted)} added</span><span>{formatNumber(masterImport.duplicates)} duplicates</span></div>
+    <div className="panel-header"><div><p className="eyebrow">PRIVATE SHARED MASTER</p><h3>Master number file</h3></div><div className="setting-icon"><Database size={17} /></div></div>
+    <div className="data-summary"><Database size={18} /><div><strong>{formatNumber(masterInfo.count)} unique numbers</strong><span>{masterInfo.initialized ? "Shared securely across your signed-in devices" : "Waiting for the one-time PC import"}</span></div></div>
+    <p className="master-description">Your master lives in a private Supabase database. The source file stays in the local data folder; import it once from your PC using the documented streaming command. Phones do not need to upload or store the large file.</p>
+    <div className="master-readiness"><ShieldCheck size={16} /><span>Every generation is checked against the shared database and only new numbers are added.</span></div>
+    {legacyMasterCount > 0 && <div className="legacy-master-note">
+      <p><strong>{formatNumber(legacyMasterCount)} numbers remain in an old local master copy.</strong> Clear it only after the shared master is ready; generated history is not removed.</p>
+      <button className="danger-button" disabled={!masterInfo.initialized} onClick={onClearLegacyMaster}>{masterInfo.initialized ? "Clear old local copy" : "Import master first"}</button>
     </div>}
-    <div className="master-export">
-      <button className="secondary-button" disabled={!masterInfo.initialized || !!masterImport || masterExporting} onClick={onExportMaster}>
-        {masterExporting ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}
-        {masterExporting ? "Exporting master…" : "Download updated master TXT"}
-      </button>
-      {masterExporting && <div className="master-import-progress"><div className="progress-caption"><span>Writing master file</span><strong>{masterExportProgress}%</strong></div><ProgressBar value={masterExportProgress} /></div>}
-      <p className="master-description">The source file is unchanged. The downloaded master includes all imported and newly generated unique numbers.</p>
-      <p className="master-description">Very large exports need Chrome or Edge on PC; Safari can download smaller master lists.</p>
-    </div>
   </section>
-  <section className="panel data-panel"><div className="panel-header"><div><p className="eyebrow">DEVICE STORAGE</p><h3>Your data, your choice</h3></div><div className="setting-icon green"><ShieldCheck size={17} /></div></div><div className="data-summary"><Database size={18} /><div><strong>{formatNumber(totalEntries)} generated entries</strong><span>Saved in this browser's IndexedDB</span></div></div><div className="danger-zone"><div><strong>Delete generation history</strong><span>Removes generated session exports. The master list is kept unchanged.</span></div><button className="danger-button" onClick={onDeleteAll}><Trash2 size={15} /> Delete all</button></div><div className="data-policy"><ShieldCheck size={17} /><p><strong>Local-first by default</strong><br />No analytics, accounts, or network uploads. Your generated data stays on this device.</p></div></section></div></TranslateTree>;
+  <section className="panel data-panel"><div className="panel-header"><div><p className="eyebrow">DEVICE STORAGE</p><h3>Your data, your choice</h3></div><div className="setting-icon green"><ShieldCheck size={17} /></div></div><div className="data-summary"><Database size={18} /><div><strong>{formatNumber(totalEntries)} generated entries</strong><span>Saved in this browser's IndexedDB</span></div></div><div className="danger-zone"><div><strong>Delete generation history</strong><span>Removes generated session exports. The shared master is kept unchanged.</span></div><button className="danger-button" onClick={onDeleteAll}><Trash2 size={15} /> Delete all</button></div><div className="data-policy"><ShieldCheck size={17} /><p><strong>Private shared master</strong><br />Only generated candidates are sent to the authenticated Supabase master for duplicate checks. Session history and exports stay on this device.</p></div></section></div></TranslateTree>;
 }
 
 function SessionRow({ session }: { session: GenerationSession }) {

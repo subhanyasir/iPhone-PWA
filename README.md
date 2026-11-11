@@ -1,94 +1,118 @@
 # Italian Number Generator
 
-A local-first Progressive Web App for creating synthetic Italian-format mobile numbers. It uses a Web Worker for generation and IndexedDB for persistent browser storage. Generated data is not uploaded to a server.
+A React, Vite, and PWA app for generating synthetic Italian-format mobile numbers. The interface defaults to Italian, supports English, and includes dark and light themes.
 
-The interface defaults to Italian, with English available from the language selector. Language and light/dark appearance preferences are saved in this browser.
+## How the shared master works
 
-## Private master-number file
+The master TXT stays in your local `data\` folder and is not included in Git or Vercel. Import it once from your PC directly into a private Supabase Postgres database. The importer streams the file to the database; it does not send the file through this app or through Vercel.
 
-The large master file belongs in the local `data/` folder and is intentionally excluded from Git and Vercel deployments. Never commit or publish it: a deployed static asset would be downloadable by anyone.
+When signed in, each generation batch is submitted to an authenticated database function. A unique database key atomically filters numbers already in the master and adds only new numbers. Only returned unique values are saved in the current browser's IndexedDB session. The master is shared between authorized devices; session history, preferences, and exports remain local to each browser. Generation requires an internet connection and an authorized Supabase account. The installed PWA can cache its app shell for offline reopening, but cannot check or update the shared master offline.
 
-In the app, open **Settings → Master number file** and select the TXT file from the device. Import is streamed in bounded batches; use one phone number per line. The file is merged into a separate IndexedDB master list on that device, with duplicates ignored. Generation is disabled until an import completes. Every generated candidate is checked against this master list, and only new unique numbers are saved to the generation session and appended to the master list in the same local transaction.
-
-The browser cannot modify the original file in `data/`. The IndexedDB list becomes the writable master for that browser/device; the source TXT remains unchanged. Use **Download updated master TXT** to save the complete local master. Very large exports stream directly to disk in Chrome or Edge on PC; browsers without file-stream support can download smaller masters, or you can export generated sessions and merge those additions into the source file on your PC. Import the master separately on each device. Clearing generation history does not remove master numbers.
-
-The master list is private to the browser profile and is not synced to Vercel or other devices. A large import requires adequate browser storage; if storage fills, imported batches remain local and safe, and the same file can be imported again to continue merging.
+The database stores phone-number strings, not names or other personal information. The generator is for synthetic test data only: generated values can match real assigned phone numbers. Do not call or message them.
 
 ## Requirements
 
-- Node.js 20.19+ or 22.12+ (Node 24 is also supported)
+- Node.js 20.19+ or 22.12+ (Node 24 is supported)
 - npm
-- VS Code (optional)
+- A Supabase project with enough database capacity for the source data, its indexes, and import overhead
+- The source master TXT in the ignored `data\` folder
 
-## Run locally on Windows
+**Check Supabase database disk capacity and plan limits before importing.** The current source file is roughly 759 MB, and Postgres needs additional space for the table, unique index, transaction work, and future growth. Do not start an import unless the project has sufficient capacity. The importer leaves the original source file unchanged.
 
-Open PowerShell in the project folder:
+## Set up Supabase
+
+1. Create a Supabase project and check its current database storage limits and available disk.
+2. In the Supabase SQL Editor, run [`supabase/migrations/202611120001_shared_master.sql`](./supabase/migrations/202611120001_shared_master.sql).
+3. Create your single application user in Supabase Authentication. Disable public sign-ups after creating it.
+4. In the SQL Editor, authorize that user's Auth user ID:
+
+   ```sql
+   insert into public.master_access (user_id)
+   values ('YOUR-AUTH-USER-UUID');
+   ```
+
+   Use the user's UUID from Supabase Authentication, not their email. Only allowlisted accounts can call the master RPCs. Do not add a service-role key to the application.
+5. Copy `.env.example` to `.env.local` and set `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` using the project's public URL and publishable/anon key. These two public values are required by the app. Never use a service-role key or database password for either variable.
+6. Configure the same two public variables in the Vercel project's environment settings before deploying.
+
+The migration denies direct access to the master tables and exposes only status and atomic candidate-add RPCs to authenticated users. Keep Supabase Authentication and database credentials private.
+
+## Import the master once from Windows
+
+Install dependencies and run the app locally:
 
 ```powershell
 npm install
 npm run dev
 ```
 
-Open the local URL printed by Vite (normally `http://localhost:5173`). To test on an iPhone on the same Wi-Fi, run `npm run dev -- --host 0.0.0.0` and open the computer's LAN URL on the phone. For Add to Home Screen and service-worker checks, use an HTTPS deployment; iOS does not install a PWA from an ordinary LAN HTTP URL.
-
-## Build and preview
+In a separate PowerShell window, from the project directory, set the private database connection string for that shell and start the importer:
 
 ```powershell
+$env:DATABASE_URL = Read-Host "Paste the private Supabase database connection string"
+npm run import:master -- "data\TUTTI_NUMERI_GENERATI_UNICI_AGGIORNATO.txt"
+Remove-Item Env:DATABASE_URL
+```
+
+Use the Supabase Postgres direct connection or an appropriate session-pooler connection string. Do not use the public app key here. The script prints the file size, asks you to type `IMPORT`, then streams and normalizes lines into a temporary staging table before merging unique numbers into the master. It reports line progress and a final count. The source TXT is not modified. Re-running the importer is safe for duplicates, but repeats the full upload; only run it again if needed.
+
+The import uses a database transaction and may take a long time. Keep the PC and connection running until it finishes. If the transaction is interrupted, the master is not marked initialized; after resolving the cause and confirming disk capacity, rerun the import. Do not import the large file through an iPhone browser or upload it to a public/static hosting folder.
+
+## Run, test, and build
+
+```powershell
+npm run dev
+npm test
 npm run build
 npm run preview
 ```
 
-The production files are written to `dist/`. `npm test` runs the automated test suite.
+Open the Vite URL printed in the terminal. The production build is written to `dist\`. Generation batches are produced in a Web Worker; IndexedDB stores local session results, and TXT/CSV exports read sessions in bounded pages. The app caps a generation session at 2,000,000 unique values. Browser storage quotas still apply; large sessions need enough free space on the device.
 
 ## Deploy from GitHub to Vercel
 
-1. Create an empty repository on GitHub (do not initialize it with a README or license).
-2. In PowerShell, from the project directory, initialize and push the project. Replace the remote URL with your repository URL:
+1. Create a private GitHub repository. Confirm `data\` and `.env.local` are not staged; both are excluded by `.gitignore`.
+2. From PowerShell in this project folder, connect and push the repository:
 
    ```powershell
    git init
    git add .
+   git status
    git commit -m "Initial Italian Number Generator app"
    git branch -M main
-   git remote add origin https://github.com/<USERNAME>/<REPOSITORY>.git
+   git remote add origin https://github.com/YOUR-ACCOUNT/YOUR-REPOSITORY.git
    git push -u origin main
    ```
 
-3. Sign in to [Vercel](https://vercel.com/), choose **Add New → Project**, and import the GitHub repository.
-4. Keep the detected Vite settings: build command `npm run build`, output directory `dist`, and install command `npm install`. No environment variables or backend services are required.
-5. Choose **Deploy**. Every later push to the connected production branch triggers a new deployment.
-6. Open the production HTTPS URL and verify the app, offline shell, and manifest in the browser.
+3. In Vercel, import the GitHub repository. Use build command `npm run build` and output directory `dist`.
+4. Add `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` to the Vercel environment settings for the deployment environments, then deploy.
+5. After the import completes, reload the app. Open the HTTPS deployment, sign in with the allowlisted Supabase account, and verify that Settings reports the shared master as initialized before generating.
 
-The `vercel.json` rewrite supports SPA routes. No API routes are used.
+Do not add `DATABASE_URL`, a database password, or a service-role key to Vercel. The Vercel deployment serves the app; the bulk importer sends the master directly from the PC to Supabase.
 
 ## Install on iPhone
 
-1. Deploy the site to Vercel and open its HTTPS URL in **Safari** on the iPhone.
-2. Tap **Share** → **Add to Home Screen**.
-3. Keep **Open as Web App** enabled (if shown) and tap **Add**.
-4. Launch **Italian Numbers** from the Home Screen. The interface adapts to the safe areas and standalone display.
+1. Open the deployed HTTPS URL in Safari.
+2. Tap **Share → Add to Home Screen**, leave **Open as Web App** enabled if offered, and tap **Add**.
+3. Open the Home Screen app and sign in. Generation and duplicate checks require internet access; the PWA shell may reopen offline.
 
-The service worker caches the application shell for offline reopening. Number data is kept in that browser's IndexedDB; clearing Safari website data or removing browser data can remove it. Exports are created locally. Browsers exposing the File System Access API can write export chunks directly to a selected file; other browsers download a Blob assembled from bounded database reads, which may require substantial device memory for very large exports.
+The interface supports iPhone safe areas and touch-sized controls. Session data is per-browser: clearing Safari website data can remove local history and exports, but does not delete the shared Supabase master.
 
-## Data and performance notes
-
-- Italian-style synthetic mobile numbers use a 10-digit national part beginning with `3`, preceded by the configurable country code (default `39`). They are not checked against carrier allocations and may coincide with real assigned numbers; do not call or message generated entries.
-- Generation is capped at 2,000,000 entries per session and runs in a dedicated Web Worker in batches. The interface displays progress, generation rate, pause/resume, and cancellation.
-- IndexedDB persists sessions, generated entries, and the imported master list on the current device. Every generated candidate is checked against the master list; duplicates are always skipped, regardless of earlier generation preferences.
-- Storage capacity is controlled by the browser and device. Large runs may fail if quota is reached; reduce batch size or quantity and free device storage if needed.
-- Avoid duplicate generation sessions: a second session cannot start while one is active. Reloading during generation records the session as interrupted and preserves already-saved batches.
-- No master numbers, generated entries, telemetry, account data, or settings are transmitted to a server. Vercel hosts static application assets only.
+If a previous version left a partial master import in a browser's IndexedDB, Settings shows its local count and offers to clear that old copy only after the shared master is initialized. This cleanup does not remove session history or change Supabase.
 
 ## Project layout
 
 ```text
 src/
-  App.tsx               Responsive dashboard and application workflows
-  db.ts                 IndexedDB persistence and paged reads
-  masterFile.ts         Streamed master TXT parsing
-  generation.worker.ts  Batch number generation
-  main.tsx              React entry point and PWA registration
-  styles.css            Responsive dark dashboard and iPhone safe areas
-  types.ts              Shared app data types
-public/icons/           PWA and iOS touch icons
+  App.tsx               Dashboard, authentication, and generation workflows
+  db.ts                 IndexedDB settings, sessions, and paged reads
+  masterApi.ts          Authenticated Supabase master RPC calls
+  supabase.ts           Public app client configuration
+  generation.worker.ts  Batched synthetic-number generation
+  exportFormat.ts       TXT and CSV formatting
+  styles.css            Responsive themes and iPhone safe-area layout
+supabase/migrations/    Private master schema and access-controlled RPCs
+scripts/import-master.mjs
+                       PC-side streaming import to Supabase
+public/icons/           PWA and iOS icons
 ```
