@@ -40,7 +40,7 @@ The production files are written to `dist/`. `npm test` runs the automated test 
    git add .
    git commit -m "Initial Italian Number Generator app"
    git branch -M main
-   git remote add origin https://github.com/subhanyasir/iPhone-PWA.git
+   git remote add origin https://github.com/tc067367-web/iphone-pws.git
    git push -u origin main
    ```
 
